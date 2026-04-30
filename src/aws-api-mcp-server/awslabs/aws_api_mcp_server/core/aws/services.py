@@ -13,10 +13,16 @@
 # limitations under the License.
 
 import awscli.clidriver
+import awscli.shorthand
 import re
 from ..common.config import get_user_agent_extra
-from ..common.file_system_controls import get_file_validated
+from ..common.file_system_controls import (
+    get_file_validated,
+    is_streaming_blob_argument,
+    validate_file_path,
+)
 from ..common.models import Credentials
+from awscli.arguments import CLIArgument
 from awscli.paramfile import URIArgumentHandler
 from botocore.model import OperationModel
 from collections.abc import Set
@@ -25,18 +31,14 @@ from lxml import html
 from typing import Any, NamedTuple
 
 
-def _deny_remote_prefix(prefix, _uri):
-    raise ValueError(f'{prefix} prefix is not allowed')
+LOCAL_PREFIX_MAP = {
+    'file://': (get_file_validated, {'mode': 'r'}),
+    'fileb://': (get_file_validated, {'mode': 'rb'}),
+}
 
+RESTRICTED_URI_HANDLER = URIArgumentHandler(prefixes=LOCAL_PREFIX_MAP)
 
-RESTRICTED_URI_HANDLER = URIArgumentHandler(
-    prefixes={
-        'file://': (get_file_validated, {'mode': 'r'}),
-        'fileb://': (get_file_validated, {'mode': 'rb'}),
-        'http://': (_deny_remote_prefix, {}),
-        'https://': (_deny_remote_prefix, {}),
-    }
-)
+awscli.shorthand.LOCAL_PREFIX_MAP = LOCAL_PREFIX_MAP
 
 
 PaginationConfig = dict[str, int]
@@ -52,11 +54,17 @@ class ConfigResult(NamedTuple):
 filter_query = re.compile(r'^\s+([-a-z0-9_.]+|tag:<key>)\s+')
 
 
+def _validate_streaming_blob_path(cli_argument: CLIArgument, value: Any, **_kwargs):
+    if is_streaming_blob_argument(cli_argument) and isinstance(value, str):
+        validate_file_path(value)
+
+
 def get_awscli_driver(credentials: Credentials | None = None) -> awscli.clidriver.CLIDriver:
     """Create a AWS CLI driver to execute aws commands."""
     driver = awscli.clidriver.create_clidriver()
     session = driver.session
     session.register('load-cli-arg', RESTRICTED_URI_HANDLER)
+    session.register('process-cli-arg.*.*', _validate_streaming_blob_path)
 
     # append user agent to session for aws cli customizations
     session.user_agent_extra += ' ' + get_user_agent_extra() + ' cli-customizations'

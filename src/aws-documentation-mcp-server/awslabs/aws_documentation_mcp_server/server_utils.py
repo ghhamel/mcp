@@ -13,9 +13,10 @@
 # limitations under the License.
 import httpx
 import os
-from awslabs.aws_documentation_mcp_server.models import SearchResult
+from awslabs.aws_documentation_mcp_server.models import SearchResponse
 from awslabs.aws_documentation_mcp_server.util import (
     extract_content_from_html,
+    extract_sections_from_html,
     format_documentation_result,
     is_html_content,
 )
@@ -105,20 +106,20 @@ async def read_documentation_impl(
 SEARCH_RESULT_CACHE = deque(maxlen=3)
 
 
-def add_search_result_cache_item(search_results: list[SearchResult]) -> None:
+def add_search_result_cache_item(search_response: SearchResponse) -> None:
     """Adds list of SearchResult items to cache.
 
     Add search results to the front of the cache, to ensure that
     the most recent query ID is ahead for duplicate URLs.
 
     Args:
-        search_results: List returned by the search_documentation tool
+        search_response: SearchResponse object returned by the search_documentation tool
 
     Returns:
         None; updates the global SEARCH_RESULT_CACHE
 
     """
-    SEARCH_RESULT_CACHE.appendleft(search_results)
+    SEARCH_RESULT_CACHE.appendleft(search_response)
 
 
 def get_query_id_from_cache(url: str) -> Optional[str]:
@@ -134,11 +135,84 @@ def get_query_id_from_cache(url: str) -> Optional[str]:
         Query ID of URL, or None
 
     """
-    for _, search_results in enumerate(SEARCH_RESULT_CACHE):
-        for search_result in search_results:
+    for _, search_response in enumerate(SEARCH_RESULT_CACHE):
+        for search_result in search_response.search_results:
             if search_result.url == url:
                 # Sanitization of query_id just in case
-                query_id = quote(search_result.query_id)
+                query_id = quote(search_response.query_id)
                 return query_id
 
     return None
+
+
+async def read_sections_impl(
+    ctx: Context,
+    url_str: str,
+    section_titles: list[str],
+    session_uuid: str,
+) -> str:
+    """The implementation of the read_sections tool."""
+    logger.debug(f'Fetching sections {section_titles} from {url_str}')
+
+    url_with_session = f'{url_str}?session={session_uuid}'
+    sections_param = ','.join(quote(title.strip(), safe='') for title in section_titles)
+    url_with_session += f'&sections={sections_param}'
+
+    query_id = get_query_id_from_cache(url_str)
+    if query_id:
+        url_with_session += f'&query_id={query_id}'
+        logger.debug(f'Using query_id {query_id}')
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                url_with_session,
+                follow_redirects=True,
+                headers={
+                    'User-Agent': DEFAULT_USER_AGENT,
+                    'X-MCP-Session-Id': session_uuid,
+                },
+                timeout=30,
+            )
+        except httpx.HTTPError as e:
+            error_msg = f'Failed to fetch {url_str}: {str(e)}'
+            logger.error(error_msg)
+            await ctx.error(error_msg)
+            return error_msg
+
+        if response.status_code >= 400:
+            error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
+            logger.error(error_msg)
+            await ctx.error(error_msg)
+            return error_msg
+
+        page_raw = response.text
+        content_type = response.headers.get('content-type', '')
+
+    if not is_html_content(page_raw, content_type):
+        return 'Cannot extract sections from non-HTML content. Please use the read_documentation tool instead to get the full document content.'
+
+    try:
+        filtered_content = extract_sections_from_html(page_raw, section_titles)
+    except ValueError as e:
+        error_msg = str(e)
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        raise
+
+    try:
+        markdown = extract_content_from_html(filtered_content)
+
+        # detect tagged error responses
+        if markdown.startswith('<e>') and markdown.endswith('</e>'):
+            # strip only the outer wrapper tags
+            error_msg = markdown[3:-4]
+            raise ValueError(error_msg)
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(error_msg)
+        await ctx.error(error_msg)
+        raise
+
+    return markdown

@@ -14,131 +14,247 @@
 
 """awslabs AWS Bedrock AgentCore MCP Server implementation."""
 
-from .utils import cache, text_processor
+import asyncio
+import os
+from .tools import docs
+from .utils import cache
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from loguru import logger
 from mcp.server.fastmcp import FastMCP
-from typing import Any, Dict, List
 
 
 APP_NAME = 'amazon-bedrock-agentcore-mcp-server'
-mcp = FastMCP(APP_NAME)
+
+AGENTCORE_MCP_INSTRUCTIONS = (
+    'Use this MCP server to access Amazon Bedrock AgentCore services — '
+    'agent runtime, code interpreter sandboxes, cloud browser sessions, '
+    'memory, gateway, identity, policy, evaluations, and documentation.\n\n'
+    '## Code Interpreter Tools\n'
+    'Use start_code_interpreter_session to create a sandbox, then execute_code, '
+    'execute_command, or install_packages to run code. Use upload_file and '
+    'download_file to transfer data. Stop sessions when done to release '
+    'resources.\n\n'
+    '## Browser Tools\n'
+    'Start a browser session with start_browser_session, then use browser '
+    'interaction tools (browser_navigate, browser_snapshot, browser_click, '
+    'browser_type, etc.) to interact with web pages. Each session runs in an '
+    'isolated cloud environment — no local browser installation is required. '
+    'Call stop_browser_session when done.\n\n'
+    'Tips:\n'
+    '- Use DuckDuckGo or Bing instead of Google — Google blocks cloud browser '
+    'IPs with CAPTCHAs.\n'
+    '- For content-heavy pages, use browser_evaluate with JavaScript to extract '
+    'specific data instead of relying solely on the accessibility snapshot, '
+    'which can be very large.\n'
+    '- For data extraction, prefer browser_evaluate over browser_snapshot. '
+    'Use querySelectorAll to extract structured JSON (e.g., '
+    '`[...document.querySelectorAll("tr")].map(r => r.innerText)`). '
+    'Snapshots are best for understanding page structure and finding element '
+    'refs; evaluate is best for extracting actual text and data.\n'
+    '- To set long text in form fields, use browser_evaluate with '
+    '`document.querySelector("selector").value = "text"` instead of '
+    'browser_type or browser_fill_form, which type character-by-character '
+    'and may timeout on long inputs.\n'
+    '- The timeout_seconds parameter on start_browser_session is an idle '
+    'timeout measured from the last activity, not an absolute session '
+    'duration. Active sessions persist as long as there is interaction '
+    'within the timeout window.'
+)
 
 
-@mcp.tool()
-def search_agentcore_docs(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    """Search curated AgentCore documentation and return ranked results with snippets.
+def _is_service_enabled(name: str) -> bool:
+    """Check if a service should be registered based on env vars."""
+    disable = os.getenv('AGENTCORE_DISABLE_TOOLS', '')
+    enable = os.getenv('AGENTCORE_ENABLE_TOOLS', '')
 
-    This tool provides access to the complete Amazon Bedrock AgentCore documentation including:
-
-    **Platform Overview:**
-    - What is Bedrock AgentCore, security overview, quotas and limits
-
-    **Platform Services:**
-    - AgentCore Runtime (serverless deployment and scaling)
-    - AgentCore Memory (persistent knowledge with event and semantic memory)
-    - AgentCore Code Interpreter (secure code execution in isolated sandboxes)
-    - AgentCore Browser (fast, secure cloud-based browser for web interaction)
-    - AgentCore Gateway (transform existing APIs into agent tools)
-    - AgentCore Observability (real-time monitoring and tracing)
-    - AgentCore Identity (secure authentication and access management)
-
-    **Getting Started:**
-    - Prerequisites & environment setup
-    - Building your first agent or transforming existing code
-    - Local development & testing
-    - Deployment to AgentCore using CLI
-    - Troubleshooting & enhancement
-
-    **Examples & Tutorials:**
-    - Basic agent creation, memory integration, tool usage
-    - Streaming responses, error handling, authentication
-    - Customer service agents, code review assistants, data analysis
-    - Multi-agent workflows and integrations
-
-    **API Reference:**
-    - Data plane and control API documentation
-
-    Use this to find relevant AgentCore documentation for any development question.
-
-    Args:
-        query: Search query string (e.g., "bedrock agentcore", "memory integration", "deployment guide")
-        k: Maximum number of results to return (default: 5)
-
-    Returns:
-        List of dictionaries containing:
-        - url: Document URL
-        - title: Display title
-        - score: Relevance score (0-1, higher is better)
-        - snippet: Contextual content preview
-
-    """
-    cache.ensure_ready()
-    index = cache.get_index()
-    results = index.search(query, k=k) if index else []
-    url_cache = cache.get_url_cache()
-
-    # Collect top-k URLs that need hydration (no content yet)
-    # Simplified: Direct hydration in one pass
-    top = results[: min(len(results), cache.SNIPPET_HYDRATE_MAX)]
-    for _, doc in top:
-        cached = url_cache.get(doc.uri)
-        if cached is None or not cached.content:
-            cache.ensure_page(doc.uri)
-
-    # Build response with real content snippets when available
-    return_docs: List[Dict[str, Any]] = []
-    for score, doc in results:
-        page = url_cache.get(doc.uri)
-        snippet = text_processor.make_snippet(page, doc.display_title)
-        return_docs.append(
-            {
-                'url': doc.uri,
-                'title': doc.display_title,
-                'score': round(score, 3),
-                'snippet': snippet,
-            }
+    if enable and disable:
+        logger.warning(
+            'Both AGENTCORE_ENABLE_TOOLS and AGENTCORE_DISABLE_TOOLS are set.'
+            ' AGENTCORE_ENABLE_TOOLS takes precedence;'
+            ' AGENTCORE_DISABLE_TOOLS is ignored.'
         )
-    return return_docs
+
+    if enable:
+        allowed = {t.strip().lower() for t in enable.split(',') if t.strip()}
+        if not allowed:
+            logger.warning(
+                'AGENTCORE_ENABLE_TOOLS is set but contains no valid '
+                'entries. All services enabled.'
+            )
+            return True
+        return name.lower() in allowed
+    if disable:
+        blocked = {t.strip().lower() for t in disable.split(',') if t.strip()}
+        return name.lower() not in blocked
+    return True
 
 
-@mcp.tool()
-def fetch_agentcore_doc(uri: str) -> Dict[str, Any]:
-    """Fetch full document content by URL.
+# Browser managers — set during registration, used by lifespan
+_browser_cm = None
+_browser_sm = None
 
-    Retrieves complete AgentCore documentation content from URLs found via search_agentcore_docs
-    or provided directly. Use this to get full documentation pages including:
+# Code interpreter cleanup function
+_code_interpreter_cleanup = None
 
-    - Complete platform overview and service documentation
-    - Detailed getting started guides with step-by-step instructions
-    - Full API reference documentation
-    - Comprehensive tutorial and example code
-    - Complete deployment and configuration instructions
-    - Integration guides for various frameworks (Strands, LangGraph, CrewAI, etc.)
 
-    This provides the full content when search snippets aren't sufficient for
-    understanding or implementing AgentCore features.
+@asynccontextmanager
+async def server_lifespan(server: FastMCP) -> AsyncIterator[None]:
+    """Manage server lifecycle.
 
-    Args:
-        uri: Document URI (supports http/https URLs)
-
-    Returns:
-        Dictionary containing:
-        - url: Canonical document URL
-        - title: Document title
-        - content: Full document text content
-        - error: Error message (if fetch failed)
-
+    Handles browser cleanup task, code interpreter cleanup, and
+    graceful shutdown.
     """
-    cache.ensure_ready()
+    if _browser_cm is not None and _browser_sm is not None:
+        from .tools.browser import cleanup_stale_sessions
 
-    page = cache.ensure_page(uri)
-    if page is None:
-        return {'error': 'fetch failed', 'url': uri}
+        task = asyncio.create_task(cleanup_stale_sessions(_browser_cm, _browser_sm))
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await _browser_cm.cleanup()
+            if _code_interpreter_cleanup is not None:
+                await _code_interpreter_cleanup()
+    else:
+        try:
+            yield
+        finally:
+            if _code_interpreter_cleanup is not None:
+                await _code_interpreter_cleanup()
 
-    return {
-        'url': page.url,
-        'title': page.title,
-        'content': page.content,
-    }
+
+mcp = FastMCP(
+    APP_NAME,
+    instructions=AGENTCORE_MCP_INSTRUCTIONS,
+    lifespan=server_lifespan,
+)
+
+# Docs tools are always registered (no opt-out)
+mcp.tool()(docs.search_agentcore_docs)
+mcp.tool()(docs.fetch_agentcore_doc)
+
+if _is_service_enabled('runtime'):
+    try:
+        from .tools.runtime import register_runtime_tools
+
+        register_runtime_tools(mcp)
+        logger.info('Runtime tools registered')
+    except ImportError as e:
+        logger.error(f'Runtime tools disabled — failed to import dependencies: {e}.')
+    except Exception as e:
+        logger.error(
+            f'Runtime tools disabled — initialization failed: {e}. '
+            f'Set AGENTCORE_DISABLE_TOOLS=runtime to suppress.'
+        )
+
+if _is_service_enabled('memory'):
+    try:
+        from .tools.memory import register_memory_tools
+
+        register_memory_tools(mcp)
+        logger.info('Memory tools registered (21 tools)')
+    except ImportError as e:
+        logger.error(
+            f'Memory tools disabled — failed to import dependencies: {e}.'
+            f' Ensure boto3 and botocore are installed.'
+        )
+    except Exception as e:
+        logger.error(
+            f'Memory tools disabled — initialization failed: {e}. '
+            f'Set AGENTCORE_DISABLE_TOOLS=memory to suppress.'
+        )
+
+if _is_service_enabled('identity'):  # pragma: no cover
+    try:
+        from .tools.identity import register_identity_tools  # type: ignore
+
+        register_identity_tools(mcp)
+        logger.info('Identity tools registered (21 tools)')
+    except ImportError as e:
+        logger.error(f'Identity tools disabled — failed to import: {e}.')
+    except Exception as e:
+        logger.error(
+            f'Identity tools disabled — initialization failed: {e}. '
+            f'Set AGENTCORE_DISABLE_TOOLS=identity to suppress.'
+        )
+
+if _is_service_enabled('gateway'):  # pragma: no cover
+    try:
+        from .tools.gateway import register_gateway_tools  # type: ignore
+
+        register_gateway_tools(mcp)
+        logger.info('Gateway tools registered (15 tools)')
+    except (ImportError, AttributeError):
+        # Sub-package not yet installed — fall back to flat guide
+        try:
+            from .tools import gateway as _gw_flat
+
+            mcp.tool()(_gw_flat.manage_agentcore_gateway)
+        except ImportError:
+            logger.error('Gateway tools disabled — no module found.')
+    except Exception as e:
+        logger.error(
+            f'Gateway tools disabled — initialization failed: {e}. '
+            f'Set AGENTCORE_DISABLE_TOOLS=gateway to suppress.'
+        )
+
+if _is_service_enabled('policy'):  # pragma: no cover
+    try:
+        from .tools.policy import register_policy_tools  # type: ignore
+
+        register_policy_tools(mcp)
+        logger.info('Policy tools registered (15 tools)')
+    except ImportError as e:
+        logger.error(f'Policy tools disabled — failed to import: {e}.')
+    except Exception as e:
+        logger.error(
+            f'Policy tools disabled — initialization failed: {e}. '
+            f'Set AGENTCORE_DISABLE_TOOLS=policy to suppress.'
+        )
+
+if _is_service_enabled('browser'):
+    try:
+        from .tools.browser import register_browser_tools
+
+        _browser_cm, _browser_sm = register_browser_tools(mcp)
+        logger.info('Browser tools registered (25 tools)')
+    except ImportError as e:
+        logger.error(
+            f'Browser tools disabled — failed to import dependencies: '
+            f'{e}. Ensure playwright and bedrock-agentcore are installed.'
+        )
+    except Exception as e:
+        logger.error(
+            f'Browser tools disabled — initialization failed: {e}. '
+            f'Set AGENTCORE_DISABLE_TOOLS=browser to suppress.'
+        )
+
+if _is_service_enabled('code_interpreter'):
+    try:
+        from .tools.code_interpreter import (
+            cleanup_code_interpreter,
+            register_code_interpreter_tools,
+        )
+
+        register_code_interpreter_tools(mcp)
+        _code_interpreter_cleanup = cleanup_code_interpreter
+        logger.info('Code interpreter tools registered (9 tools)')
+    except ImportError as e:
+        logger.error(
+            f'Code interpreter tools disabled — failed to import '
+            f'dependencies: {e}. Ensure bedrock-agentcore is installed.'
+        )
+    except Exception as e:
+        logger.error(
+            f'Code interpreter tools disabled — initialization failed: '
+            f'{e}. Set AGENTCORE_DISABLE_TOOLS=code_interpreter '
+            f'to suppress.'
+        )
 
 
 def main() -> None:

@@ -21,8 +21,15 @@ import logging
 from typing import Optional
 
 from fastmcp import FastMCP
-from fastmcp.server.proxy import ProxyClient
+from fastmcp.server import create_proxy
 from fastmcp.tools.tool_transform import ToolTransformConfig
+
+# Allowlisted AWS Knowledge tools to expose from the proxy
+DESIRED_KNOWLEDGE_PROXY_TOOLS = [
+    "aws_knowledge_aws___search_documentation",
+    "aws_knowledge_aws___read_documentation",
+    "aws_knowledge_aws___recommend",
+]
 
 # Guidance to append to tool descriptions
 # ruff: noqa: E501
@@ -34,6 +41,7 @@ ECS_TOOL_GUIDANCE = """
     New ECS features include:
     - ECS Native Blue-Green Deployments (different from CodeDeploy blue-green, launched 2025)
     - ECS Managed Instances (launched 2025)
+    - ECS Express Mode / Express Gateway Services (launched 2025)
 """
 
 logger = logging.getLogger(__name__)
@@ -52,10 +60,10 @@ def register_proxy(mcp: FastMCP) -> Optional[bool]:
     """
     try:
         logger.info("Setting up AWS Knowledge MCP Server proxy")
-        aws_knowledge_proxy = FastMCP.as_proxy(
-            ProxyClient("https://knowledge-mcp.global.api.aws"), name="AWS-Knowledge-Bridge"
+        aws_knowledge_proxy = create_proxy(
+            "https://knowledge-mcp.global.api.aws", name="AWS-Knowledge-Bridge"
         )
-        mcp.mount(aws_knowledge_proxy, prefix="aws_knowledge")
+        mcp.mount(aws_knowledge_proxy, namespace="aws_knowledge")
 
         # Add prompt patterns for blue-green deployments
         register_ecs_prompts(mcp)
@@ -76,26 +84,42 @@ async def apply_tool_transformations(mcp: FastMCP) -> None:
         mcp: The FastMCP server instance to apply transformations to
     """
     logger.info("Applying tool transformations...")
+    await _filter_knowledge_proxy_tools(mcp)
     await _add_ecs_guidance_to_knowledge_tools(mcp)
 
 
-async def _add_ecs_guidance_to_knowledge_tools(mcp: FastMCP) -> None:
-    """Add ECS documentation guidance to specific tools if they exist."""
+async def _filter_knowledge_proxy_tools(mcp: FastMCP) -> None:
+    """Filter AWS Knowledge proxy tools to only expose allowlisted tools."""
     try:
-        tools = await mcp.get_tools()
+        tools = await mcp.list_tools()
+        tools_by_name = {tool.name: tool for tool in tools}
 
-        knowledge_tools = [
-            "aws_knowledge_aws___search_documentation",
-            "aws_knowledge_aws___read_documentation",
-            "aws_knowledge_aws___recommend",
-        ]
+        # Disable tools that are not in the DESIRED_KNOWLEDGE_PROXY_TOOLS allowlist
+        for tool_name in tools_by_name:
+            if not tool_name.startswith("aws_knowledge_"):
+                continue
+            if tool_name not in DESIRED_KNOWLEDGE_PROXY_TOOLS:
+                logger.debug(f"Disabling tool {tool_name} from AWS Knowledge proxy")
+                mcp.disable(names={tool_name})
 
-        for tool_name in knowledge_tools:
-            if tool_name not in tools:
+        logger.debug(f"Filtered AWS Knowledge tools to allowlist: {DESIRED_KNOWLEDGE_PROXY_TOOLS}")
+    except Exception as e:
+        logger.error(f"Error filtering knowledge proxy tools: {e}")
+        raise
+
+
+async def _add_ecs_guidance_to_knowledge_tools(mcp: FastMCP) -> None:
+    """Add ECS documentation guidance to allowlisted knowledge tools."""
+    try:
+        tools = await mcp.list_tools()
+        tools_by_name = {tool.name: tool for tool in tools}
+
+        for tool_name in DESIRED_KNOWLEDGE_PROXY_TOOLS:
+            if tool_name not in tools_by_name:
                 logger.warning(f"Tool {tool_name} not found in MCP tools")
                 continue
 
-            original_desc = tools[tool_name].description or ""
+            original_desc = tools_by_name[tool_name].description or ""
             config = ToolTransformConfig(
                 name=tool_name, description=original_desc + ECS_TOOL_GUIDANCE
             )
@@ -167,6 +191,23 @@ def register_ecs_prompts(mcp: FastMCP) -> None:
                 "ecs instance type selection",
                 "What alternatives do I have for Fargate?",
                 "How do I migrate from Fargate to Managed Instances",
+            ],
+            "response": [
+                {
+                    "name": "aws_knowledge_aws___search_documentation",
+                }
+            ],
+        },
+        {
+            "patterns": [
+                "what is ecs express mode",
+                "what are express gateway services",
+                "ecs express mode",
+                "simplified ecs deployment",
+                "how to setup express mode",
+                "setup ecs express mode",
+                "configure ecs express mode",
+                "when to use express mode",
             ],
             "response": [
                 {

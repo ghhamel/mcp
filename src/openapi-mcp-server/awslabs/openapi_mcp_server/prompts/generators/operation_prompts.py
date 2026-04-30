@@ -20,7 +20,7 @@ from awslabs.openapi_mcp_server.prompts.models import (
 )
 from fastmcp.prompts.prompt import Prompt
 from fastmcp.prompts.prompt import PromptArgument as FastMCPPromptArgument
-from fastmcp.server.openapi import RouteType
+from fastmcp.server.providers.openapi import MCPType
 from typing import Any, Dict, List, Optional
 
 
@@ -178,16 +178,16 @@ def determine_operation_type(server: Any, path: str, method: str) -> str:
         for route in routes:
             route_path = getattr(route, 'path', '')
             route_method = getattr(route, 'method', '')
-            route_type = getattr(route, 'route_type', None)
+            mcp_type = getattr(route, 'mcp_type', None)
 
             # Check if this route matches our operation
-            if route_path == path and route_method.upper() == method.upper() and route_type:
-                # Convert RouteType enum to string
-                if route_type == RouteType.RESOURCE:
+            if route_path == path and route_method.upper() == method.upper() and mcp_type:
+                # Convert MCPType enum to string
+                if mcp_type == MCPType.RESOURCE:
                     operation_type = 'resource'
-                elif route_type == RouteType.RESOURCE_TEMPLATE:
+                elif mcp_type == MCPType.RESOURCE_TEMPLATE:
                     operation_type = 'resource_template'
-                elif route_type == RouteType.TOOL:
+                elif mcp_type == MCPType.TOOL:
                     operation_type = 'tool'
                 break
 
@@ -604,7 +604,7 @@ def create_operation_prompt(
         operation_fn = create_operation_function()
 
         # Register the function as a prompt
-        if hasattr(server, '_prompt_manager'):
+        if hasattr(server, 'add_prompt'):
             # Create tags based on operation metadata
             tags = set()
             # Get tags from the OpenAPI operation object if available
@@ -639,13 +639,13 @@ def create_operation_prompt(
             prompt.arguments = prompt_args
 
             # Add the prompt to the server
-            server._prompt_manager.add_prompt(prompt)
+            server.add_prompt(prompt)
             logger.debug(
                 f'Added operation prompt: {operation_id} with arguments: {[arg.name for arg in prompt.arguments]}'
             )
             return True
         else:
-            logger.warning('Server does not have _prompt_manager')
+            logger.warning('Server does not have add_prompt')
             return False
 
     except Exception as e:

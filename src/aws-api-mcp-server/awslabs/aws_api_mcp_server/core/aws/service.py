@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import contextlib
+import re
+from ..aws.regions import get_active_regions
 from ..aws.services import get_awscli_driver
 from ..common.config import AWS_API_MCP_PROFILE_NAME, DEFAULT_REGION
 from ..common.errors import AwsApiMcpError, Failure
+from ..common.help_command import generate_help_document
 from ..common.models import (
     AwsCliAliasResponse,
     Consent,
@@ -36,7 +39,7 @@ from ..parser.lexer import split_cli_command
 from ..security.policy import PolicyDecision, SecurityPolicy
 from .driver import interpret_command as _interpret_command
 from awslabs.aws_api_mcp_server.core.common.command import IRCommand
-from awslabs.aws_api_mcp_server.core.common.helpers import operation_timer
+from awslabs.aws_api_mcp_server.core.common.helpers import as_json, operation_timer
 from fastmcp import Context
 from fastmcp.server.elicitation import AcceptedElicitation
 from io import StringIO
@@ -124,6 +127,24 @@ def validate(ir: IRTranslation) -> ProgramValidationResponse:
     )
 
 
+async def get_help_document(
+    cli_command: str,
+    ctx: Context,
+) -> ProgramInterpretationResponse:
+    """Get help command response."""
+    args = split_cli_command(cli_command)[1:]
+    service_name = args[0]
+    operation_name = args[1]
+    help_document = generate_help_document(service_name, operation_name)
+    if help_document is None:
+        error_message = 'Failed to generate help document'
+        await ctx.error(error_message)
+        raise AwsApiMcpError(error_message)
+    return ProgramInterpretationResponse(
+        response=InterpretationResponse(json=as_json(help_document), status_code=200, error=None)
+    )
+
+
 def execute_awscli_customization(
     cli_command: str,
     ir_command: IRCommand,
@@ -155,6 +176,9 @@ def execute_awscli_customization(
 
         stdout_output = stdout_capture.getvalue()
         stderr_output = stderr_capture.getvalue()
+
+        if not stdout_output and stderr_output:
+            raise Exception(stderr_output)
 
         return AwsCliAliasResponse(response=stdout_output, error=stderr_output)
     except Exception as e:
@@ -257,3 +281,14 @@ def _to_context(context: dict[str, Any] | None) -> ContextAPIModel | None:
         args=context.get('args'),
         parameters=context.get('parameters'),
     )
+
+
+def expand_regions_if_needed(cli_command: str) -> list[str]:
+    """Expand `--region *` wildcard with available regions."""
+    region_wildcard = re.compile(r'--region\s+\*(?=\s|$)')
+    if not region_wildcard.search(cli_command):
+        return [cli_command]
+    match = re.search(r'--profile\s+(?!--)(\S+)', cli_command)
+    profile_name = match.group(1) if match else AWS_API_MCP_PROFILE_NAME
+    active_regions = get_active_regions(profile_name)
+    return [region_wildcard.sub(f'--region {region}', cli_command) for region in active_regions]
